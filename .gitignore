@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+.DS_Store
+
+# Local, auto-generated memory-extraction state (not part of the skill)
+.memory/
+CLAUDE.md
