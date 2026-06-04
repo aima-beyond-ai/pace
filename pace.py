@@ -151,6 +151,12 @@ def _git(*args: str, repo: Path | None = None) -> str:
         return ""
 
 
+def git_default_author(repo: Path | None = None) -> str:
+    """The repo's configured git user.name — the default 'who am I' for author filtering.
+    On a SHARED repo, pace must count only your own commits, not the whole team's."""
+    return _git("config", "user.name", repo=repo).strip()
+
+
 def append_jsonl(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
@@ -231,10 +237,13 @@ def filter_sessions(sessions, since: dt.datetime | None = None, until: dt.dateti
 # ---------------------------------------------------------------------------
 
 def commit_records(repo: Path, since: str | None = None, until: str | None = None,
-                   pattern: str | None = None, branch: str | None = None) -> list[dict]:
-    """Return [{sha, message, lines, ep, day}] for non-merge commits in window."""
+                   pattern: str | None = None, branch: str | None = None,
+                   author: str | None = None) -> list[dict]:
+    """Return [{sha, message, lines, ep, day}] for non-merge commits in window.
+    When `author` is set, only that author's commits are counted (shared-repo safety)."""
     args = ["log", "--no-merges", "--numstat", "--pretty=format:COMMIT %H|%ad|%s",
             "--date=iso-strict"]
+    if author: args.append(f"--author={author}")
     if since: args.append(f"--since={since}")
     if until: args.append(f"--until={until}")
     if branch: args.append(branch)
@@ -277,9 +286,12 @@ def commit_records(repo: Path, since: str | None = None, until: str | None = Non
     return records
 
 
-def markdown_lines_added(repo: Path, since: str | None = None, until: str | None = None) -> int:
-    """Lines added to *.md files in window (deletions don't count)."""
+def markdown_lines_added(repo: Path, since: str | None = None, until: str | None = None,
+                         author: str | None = None) -> int:
+    """Lines added to *.md files in window (deletions don't count).
+    When `author` is set, only that author's doc lines are counted."""
     args = ["log", "--no-merges", "--numstat", "--pretty=format:"]
+    if author: args.append(f"--author={author}")
     if since: args.append(f"--since={since}")
     if until: args.append(f"--until={until}")
     args += ["--", "*.md"]
@@ -388,9 +400,11 @@ def derive_personal_tiers(commits: list[dict], md_lines_per_day: dict[str, int],
     }
 
 
-def md_lines_by_day(repo: Path, since: str | None = None, until: str | None = None) -> dict[str, int]:
+def md_lines_by_day(repo: Path, since: str | None = None, until: str | None = None,
+                    author: str | None = None) -> dict[str, int]:
     args = ["log", "--no-merges", "--numstat", "--pretty=format:DAY %ad",
             "--date=short"]
+    if author: args.append(f"--author={author}")
     if since: args.append(f"--since={since}")
     if until: args.append(f"--until={until}")
     args += ["--", "*.md"]
@@ -476,17 +490,21 @@ def load_profile() -> dict:
 def cmd_calibrate(args) -> None:
     repo = repo_root()
     claude = claude_project_dir(repo)
+    # Author filtering (shared-repo safety): default to this repo's git user, override with --author,
+    # or pass --all-authors to count the whole repo (the original whole-repo behavior).
+    author = None if getattr(args, "all_authors", False) else (getattr(args, "author", None) or git_default_author(repo))
     print(f"Repo:           {repo}")
     print(f"Claude project: {claude or '(none — running with git signals only)'}")
+    print(f"Author filter:  {author or '(all authors — whole repo)'}")
 
     timestamps = gather_timestamps(claude) if claude else []
     sessions = compute_sessions(timestamps)
     dedication_sec = sum(s[2] for s in sessions)
     natural_days = len({s[0].astimezone().strftime("%Y-%m-%d") for s in sessions})
 
-    commits = commit_records(repo)
-    md_total = markdown_lines_added(repo)
-    md_by_day = md_lines_by_day(repo)
+    commits = commit_records(repo, author=author)
+    md_total = markdown_lines_added(repo, author=author)
+    md_by_day = md_lines_by_day(repo, author=author)
     subs = subagent_records(claude)
     ep = total_ep(commits, md_total, subs)
 
@@ -496,6 +514,7 @@ def cmd_calibrate(args) -> None:
 
     out = {
         "repo": str(repo),
+        "author": author,
         "calibrated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "first_event": timestamps[0].isoformat() if timestamps else None,
         "last_event": timestamps[-1].isoformat() if timestamps else None,
@@ -985,6 +1004,11 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub_cal = sub.add_parser("calibrate", help="Measure pace tiers from this repo.")
+    sub_cal.add_argument("--author", default=None,
+                         help="Count only this author's commits/docs (git --author match). "
+                              "Defaults to the repo's git user.name. Use on shared repos.")
+    sub_cal.add_argument("--all-authors", action="store_true", default=False,
+                         help="Count the whole repo, every contributor (legacy behavior).")
     sub_cal.set_defaults(func=cmd_calibrate)
 
     sub_start = sub.add_parser("start", help="Lock in a forecast for an upcoming PRD.")

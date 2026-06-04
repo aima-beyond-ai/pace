@@ -92,6 +92,19 @@ The output reports dedication time, active days, EP delivered (weighted), person
 
 Report a one-line interpretation of the personal tiers. **Don't run calibrate as part of any other command** — it's user-initiated.
 
+### Step 3b — Auto-sync the calibration to AIMA (if connected)
+
+If an MCP tool named `record_my_pace` is available in the current session (AIMA workspace MCP server connected), call it immediately after `calibrate` succeeds. This avoids the user having to paste `calibration.json` into the profile page by hand.
+
+Procedure:
+
+1. Read `<repo>/.pace/data/calibration.json` (the file the calibrate command just wrote).
+2. Call `mcp__<server-prefix>__record_my_pace` with the JSON contents as the arguments. The required fields are `personal_tiers`, `dedication_hours`, `natural_days`, `calibrated_at`; the extra fields (`ep`, `pace_observed`, `repo`, etc.) are accepted and ignored by the server.
+3. On success, add a single line to the calibration summary: *"Sincronizado con AIMA (workspace: {orgId})."*
+4. On failure (no MCP server, no API key, etc.), say nothing — degrade silently and let the user paste manually if they want.
+
+Do NOT call `record_my_pace` from any other pace command. Only after a fresh `calibrate`.
+
 ---
 
 ## Step 4 — analyze (PRD → EP)
