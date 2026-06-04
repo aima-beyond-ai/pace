@@ -2,13 +2,26 @@
 # install.sh — install the pace skill into the current user's Claude Code skills directory.
 #
 # Usage:
-#   bash install.sh
+#   bash install.sh           # copy pace.py + SKILL.md into ~/.claude/skills/pace
+#   bash install.sh --link    # symlink them instead (repo stays the single source of truth)
 #
 # Idempotent — safe to re-run to upgrade. Only writes pace.py and SKILL.md;
 # user-generated data under <repo>/.pace/data/ and ~/.claude/skills/pace/data/
 # is never touched.
+#
+# --link is recommended for development: it makes ~/.claude/skills/pace/{pace.py,SKILL.md}
+# point straight at this repo, so editing the repo updates the running skill instantly and
+# the two can never drift out of sync.
 
 set -euo pipefail
+
+LINK_MODE=false
+for arg in "$@"; do
+  case "$arg" in
+    --link) LINK_MODE=true ;;
+    *) echo "Unknown argument: $arg (supported: --link)" >&2; exit 2 ;;
+  esac
+done
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET_DIR="$HOME/.claude/skills/pace"
@@ -53,12 +66,23 @@ for f in pace.py SKILL.md; do
   fi
 done
 
-cp "$SOURCE_DIR/pace.py" "$TARGET_DIR/pace.py"
-cp "$SOURCE_DIR/SKILL.md" "$TARGET_DIR/SKILL.md"
-chmod +x "$TARGET_DIR/pace.py"
+if [ "$LINK_MODE" = true ]; then
+  ln -sf "$SOURCE_DIR/pace.py" "$TARGET_DIR/pace.py"
+  ln -sf "$SOURCE_DIR/SKILL.md" "$TARGET_DIR/SKILL.md"
+  echo "  linked pace.py  → $SOURCE_DIR/pace.py"
+  echo "  linked SKILL.md → $SOURCE_DIR/SKILL.md"
+else
+  cp "$SOURCE_DIR/pace.py" "$TARGET_DIR/pace.py"
+  cp "$SOURCE_DIR/SKILL.md" "$TARGET_DIR/SKILL.md"
+  chmod +x "$TARGET_DIR/pace.py"
+fi
 
 echo
-echo "✓ pace installed at $TARGET_DIR"
+if [ "$LINK_MODE" = true ]; then
+  echo "✓ pace linked into $TARGET_DIR (source of truth: $SOURCE_DIR)"
+else
+  echo "✓ pace installed at $TARGET_DIR"
+fi
 echo
 echo "Quick start:"
 echo "  cd <any-git-repo>"

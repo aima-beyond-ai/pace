@@ -58,6 +58,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+__version__ = "2.1.0"
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -1001,6 +1003,7 @@ def cmd_profile(args) -> None:
 
 def main():
     p = argparse.ArgumentParser(prog="pace", description=__doc__.split("\n\n")[0])
+    p.add_argument("--version", action="version", version=f"pace {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub_cal = sub.add_parser("calibrate", help="Measure pace tiers from this repo.")
