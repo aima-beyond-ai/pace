@@ -1,0 +1,9 @@
+# Local, machine-specific memory-extraction state — not source.
+.memory/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
