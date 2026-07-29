@@ -58,7 +58,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -199,6 +199,34 @@ def _warn_unresolvable_branch(repo: Path, branch: str | None) -> None:
           f"commit and doc EP will read 0.{hint}", file=sys.stderr)
 
 
+def _warn_unresolvable_base(repo: Path, base_commit: str | None) -> None:
+    """Warn when the commit a unit was anchored to is gone (history rewritten)."""
+    if not base_commit or _rev_resolves(repo, base_commit):
+        return
+    print(f"WARNING: base commit {base_commit[:12]} recorded in this unit does not "
+          f"resolve (history rewritten?) — falling back to the branch, if any.",
+          file=sys.stderr)
+
+
+def _rev_args(base_commit: str | None, branch: str | None,
+              repo: Path | None = None) -> list[str]:
+    """Revision selection for a unit's measurement window.
+
+    Anchoring on the commit HEAD pointed at when the unit was locked and then
+    searching every ref (`--all --not <base>`) survives what a branch name does
+    not: work on a feature branch that isn't merged yet, a branch deleted by
+    `--delete-branch` on merge, and renames. It also excludes commits made
+    *before* the lock, which a time window alone lets through at clock
+    resolution. `branch` remains the fallback for units locked before
+    base_commit existed, or whose base was rewritten away.
+    """
+    if base_commit and (repo is None or _rev_resolves(repo, base_commit)):
+        return ["--all", "--not", base_commit]
+    if branch:
+        return [branch]
+    return []
+
+
 def git_default_author(repo: Path | None = None) -> str:
     """The repo's configured git user.name — the default 'who am I' for author filtering.
     On a SHARED repo, pace must count only your own commits, not the whole team's."""
@@ -286,15 +314,17 @@ def filter_sessions(sessions, since: dt.datetime | None = None, until: dt.dateti
 
 def commit_records(repo: Path, since: str | None = None, until: str | None = None,
                    pattern: str | None = None, branch: str | None = None,
-                   author: str | None = None) -> list[dict]:
+                   author: str | None = None,
+                   base_commit: str | None = None) -> list[dict]:
     """Return [{sha, message, lines, ep, day}] for non-merge commits in window.
-    When `author` is set, only that author's commits are counted (shared-repo safety)."""
+    When `author` is set, only that author's commits are counted (shared-repo safety).
+    `base_commit` anchors the window topologically — see `_rev_args`."""
     args = ["log", "--no-merges", "--numstat", "--pretty=format:COMMIT %H|%ad|%s",
             "--date=iso-strict"]
     if author: args.append(f"--author={author}")
     if since: args.append(f"--since={since}")
     if until: args.append(f"--until={until}")
-    if branch: args.append(branch)
+    args += _rev_args(base_commit, branch, repo)
     out = _git(*args, repo=repo)
     if not out.strip():
         return []
@@ -336,17 +366,19 @@ def commit_records(repo: Path, since: str | None = None, until: str | None = Non
 
 def markdown_lines_added(repo: Path, since: str | None = None, until: str | None = None,
                          author: str | None = None, pattern: str | None = None,
-                         branch: str | None = None) -> int:
+                         branch: str | None = None,
+                         base_commit: str | None = None) -> int:
     """Lines added to *.md files in window (deletions don't count).
     When `author` is set, only that author's doc lines are counted.
 
-    `pattern` and `branch` mirror what `commit_records` applies, so both halves of
-    the EP measure the same set of commits. Without them the doc EP swept in
-    markdown from unrelated work that merely shared the window: a forecast
-    filtered to one epic was still credited with every other epic's
-    documentation, enough to report a unit COMPLETE that had barely started.
-    Asking for the subject line is what makes the filter possible at all — with an
-    empty `--pretty` the numstat rows arrive with no commit to attribute them to.
+    `pattern`, `branch` and `base_commit` mirror what `commit_records` applies, so
+    both halves of the EP measure the same set of commits. Without them the doc EP
+    swept in markdown from unrelated work that merely shared the window: a
+    forecast filtered to one epic was still credited with every other epic's
+    documentation, which is enough to report a unit as COMPLETE that had barely
+    started. Asking for the subject line is what makes the filter possible at all
+    — with an empty `--pretty` the numstat rows arrive with no commit to attribute
+    them to.
 
     Callers measuring a whole repo (calibrate) pass no pattern and count all of it.
     """
@@ -354,7 +386,7 @@ def markdown_lines_added(repo: Path, since: str | None = None, until: str | None
     if author: args.append(f"--author={author}")
     if since: args.append(f"--since={since}")
     if until: args.append(f"--until={until}")
-    if branch: args.append(branch)
+    args += _rev_args(base_commit, branch, repo)
     args += ["--", "*.md"]
     out = _git(*args, repo=repo)
     rx = re.compile(pattern, re.IGNORECASE) if pattern else None
@@ -682,11 +714,18 @@ def cmd_start(args) -> None:
     band_high = natural_days * 1.25
 
     branch = _git("rev-parse", "--abbrev-ref", "HEAD", repo=repo).strip() or None
+    base_commit = _git("rev-parse", "HEAD", repo=repo).strip() or None
+    # Recorded so status/complete measure the same author as the tiers were
+    # derived from, without re-deriving it from a config that may have changed.
+    author = cal.get("author") or git_default_author(repo) or None
 
     forecast = {
         "name": args.name,
         "mode": "forecast",
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        # Measurement anchor; `branch` below is metadata + pre-anchor fallback.
+        "base_commit": base_commit,
+        "author": author,
         "ep_estimate_raw": raw_ep,
         "ep_estimate": round(biased_ep, 2),
         "ep_bias_applied": round(bias, 3) if args.bias else 1.0,
@@ -749,16 +788,21 @@ def cmd_status(args) -> None:
     # local time while `started` is UTC, shifting the window earlier by the UTC
     # offset and sweeping in commits made before the unit was even locked.
     since_str = started.isoformat()
-    # Author filtering was applied to calibrate but not here, so the tiers were
-    # personal while a unit's progress still counted the whole team.
+    # The author the unit was locked against, so a unit measures the same person
+    # its tiers came from. Legacy units without the field fall back to git config.
     author = unit.get("author") or git_default_author(repo) or None
-    _warn_unresolvable_branch(repo, unit.get("branch"))
+    base_commit = unit.get("base_commit")
+    _warn_unresolvable_base(repo, base_commit)
+    if not base_commit or not _rev_resolves(repo, base_commit):
+        _warn_unresolvable_branch(repo, unit.get("branch"))
     commits = commit_records(repo, since=since_str,
                              pattern=unit.get("commit_filter"),
-                             branch=unit.get("branch"), author=author)
+                             branch=unit.get("branch"), author=author,
+                             base_commit=base_commit)
     md_total = markdown_lines_added(repo, since=since_str, author=author,
                                     pattern=unit.get("commit_filter"),
-                                    branch=unit.get("branch"))
+                                    branch=unit.get("branch"),
+                                    base_commit=base_commit)
     subs = subagent_records(claude, since=started, until=now)
     ep = total_ep(commits, md_total, subs)
 
@@ -837,10 +881,15 @@ def cmd_track(args) -> None:
         sys.exit(1)
 
     branch = _git("rev-parse", "--abbrev-ref", "HEAD", repo=repo).strip() or None
+    base_commit = _git("rev-parse", "HEAD", repo=repo).strip() or None
+    cal = json.loads(calibration_path().read_text()) if calibration_path().exists() else {}
+    author = cal.get("author") or git_default_author(repo) or None
     unit = {
         "name": args.name,
         "mode": "track",
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "base_commit": base_commit,
+        "author": author,
         "ep_estimate_raw": None,
         "ep_estimate": None,
         "anchor_used": None,
@@ -881,13 +930,18 @@ def cmd_complete(args) -> None:
     claude = claude_project_dir(repo)
     since_str = started.isoformat()  # see cmd_status: naive strings shift the window
     author = unit.get("author") or git_default_author(repo) or None
-    _warn_unresolvable_branch(repo, unit.get("branch"))
+    base_commit = unit.get("base_commit")
+    _warn_unresolvable_base(repo, base_commit)
+    if not base_commit or not _rev_resolves(repo, base_commit):
+        _warn_unresolvable_branch(repo, unit.get("branch"))
     commits = commit_records(repo, since=since_str,
                              pattern=unit.get("commit_filter"),
-                             branch=unit.get("branch"), author=author)
+                             branch=unit.get("branch"), author=author,
+                             base_commit=base_commit)
     md_total = markdown_lines_added(repo, since=since_str, author=author,
                                     pattern=unit.get("commit_filter"),
-                                    branch=unit.get("branch"))
+                                    branch=unit.get("branch"),
+                                    base_commit=base_commit)
     subs = subagent_records(claude, since=started, until=now)
     measured_ep = total_ep(commits, md_total, subs)["total"]
     ep_actual = args.ep_actual if args.ep_actual is not None else measured_ep
