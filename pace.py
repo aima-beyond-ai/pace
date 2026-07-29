@@ -121,10 +121,25 @@ def global_history_path() -> Path: return global_data_dir() / "history.jsonl"
 
 
 def claude_project_dir(repo: Path) -> Path | None:
-    """Derive the Claude project directory from the repo path."""
-    encoded = str(repo).replace("/", "-").replace(" ", "-")
-    candidate = Path.home() / ".claude" / "projects" / encoded
-    return candidate if candidate.exists() else None
+    """Derive the Claude project directory from the repo path.
+
+    Claude Code slugifies the absolute path, and the set of characters it
+    replaces is wider than just the separator: underscores also become dashes,
+    so a repo under `/Repositorios/_aima/` lives in `...-Repositorios--aima-...`.
+    Missing that made sessions, dedication hours and natural days all read 0 for
+    every repo whose path contains one, and dropped sub-agent EP entirely.
+
+    Try the encodings from least to most aggressive and take the first that
+    exists, so a path whose punctuation IS preserved keeps resolving.
+    """
+    raw = str(repo).replace("/", "-").replace(" ", "-")
+    encodings = [raw, raw.replace("_", "-"), raw.replace("_", "-").replace(".", "-")]
+    projects = Path.home() / ".claude" / "projects"
+    for encoded in encodings:
+        candidate = projects / encoded
+        if candidate.exists():
+            return candidate
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -142,15 +157,46 @@ def _bucket_value(value: float, buckets: list[tuple[float, float]]) -> float:
     return buckets[-1][1]
 
 
-def _git(*args: str, repo: Path | None = None) -> str:
+def _git(*args: str, repo: Path | None = None, quiet: bool = False) -> str:
+    """Run git and return stdout, or "" if it failed.
+
+    A failure is reported on stderr instead of passing silently: an empty result
+    is otherwise indistinguishable from "no work in this window", which is how a
+    stale branch name turns into a credible-looking zero. Pass quiet=True for
+    probes where failure is an expected answer (see `_rev_resolves`).
+    """
     cmd = ["git"]
     if repo:
         cmd += ["-C", str(repo)]
     cmd += list(args)
     try:
-        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        if not quiet:
+            detail = (e.stderr or "").strip().splitlines()
+            first = detail[0] if detail else f"exit {e.returncode}"
+            print(f"WARNING: git {' '.join(args[:2])} failed → {first}", file=sys.stderr)
         return ""
+
+
+def _rev_resolves(repo: Path, ref: str) -> bool:
+    """True if `ref` names a commit git can log. Failure here is an answer."""
+    return bool(_git("rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}",
+                     repo=repo, quiet=True).strip())
+
+
+def _warn_unresolvable_branch(repo: Path, branch: str | None) -> None:
+    """Warn when a unit's recorded branch no longer resolves.
+
+    Without this, `git log <gone-branch>` errors, EP reads 0, and the output is
+    indistinguishable from a genuinely idle window. A branch deleted on merge
+    (`gh pr merge --delete-branch`) hits this on every later `status`.
+    """
+    if not branch or _rev_resolves(repo, branch):
+        return
+    hint = f" Did you mean origin/{branch}?" if _rev_resolves(repo, f"origin/{branch}") else ""
+    print(f"WARNING: branch '{branch}' recorded in this unit does not resolve — "
+          f"commit and doc EP will read 0.{hint}", file=sys.stderr)
 
 
 def git_default_author(repo: Path | None = None) -> str:
@@ -289,19 +335,37 @@ def commit_records(repo: Path, since: str | None = None, until: str | None = Non
 
 
 def markdown_lines_added(repo: Path, since: str | None = None, until: str | None = None,
-                         author: str | None = None) -> int:
+                         author: str | None = None, pattern: str | None = None,
+                         branch: str | None = None) -> int:
     """Lines added to *.md files in window (deletions don't count).
-    When `author` is set, only that author's doc lines are counted."""
-    args = ["log", "--no-merges", "--numstat", "--pretty=format:"]
+    When `author` is set, only that author's doc lines are counted.
+
+    `pattern` and `branch` mirror what `commit_records` applies, so both halves of
+    the EP measure the same set of commits. Without them the doc EP swept in
+    markdown from unrelated work that merely shared the window: a forecast
+    filtered to one epic was still credited with every other epic's
+    documentation, enough to report a unit COMPLETE that had barely started.
+    Asking for the subject line is what makes the filter possible at all — with an
+    empty `--pretty` the numstat rows arrive with no commit to attribute them to.
+
+    Callers measuring a whole repo (calibrate) pass no pattern and count all of it.
+    """
+    args = ["log", "--no-merges", "--numstat", "--pretty=format:COMMIT %s"]
     if author: args.append(f"--author={author}")
     if since: args.append(f"--since={since}")
     if until: args.append(f"--until={until}")
+    if branch: args.append(branch)
     args += ["--", "*.md"]
     out = _git(*args, repo=repo)
+    rx = re.compile(pattern, re.IGNORECASE) if pattern else None
     total = 0
+    counting = rx is None
     for line in out.splitlines():
+        if line.startswith("COMMIT "):
+            counting = rx is None or bool(rx.search(line[len("COMMIT "):]))
+            continue
         line = line.strip()
-        if not line:
+        if not line or not counting:
             continue
         parts = line.split("\t")
         if parts and parts[0].isdigit():
@@ -456,8 +520,12 @@ def rebuild_profile() -> dict:
     }
     if forecast_units:
         ep_ratios = [h["ep_actual"] / h["ep_estimate"] for h in forecast_units]
+        # Only units whose days_actual really are active days. A calendar-day
+        # fallback would divide calendar days by an active-day estimate.
+        # Records written before days_source existed are assumed to be sessions.
         day_ratios = [h["days_actual"] / h["days_central"] for h in forecast_units
-                      if h.get("days_central")]
+                      if h.get("days_central")
+                      and h.get("days_source", "sessions") == "sessions"]
         if ep_ratios:
             profile["ep_bias_median"] = round(statistics.median(ep_ratios), 3)
             if len(ep_ratios) >= 4:
@@ -511,8 +579,25 @@ def cmd_calibrate(args) -> None:
     ep = total_ep(commits, md_total, subs)
 
     tiers = derive_personal_tiers(commits, md_by_day, subs)
-    ep_per_natural = ep["total"] / natural_days if natural_days else 0
-    ep_per_hour = ep["total"] / (dedication_sec / 3600) if dedication_sec else 0
+
+    # `natural_days` and `dedication_sec` only span the retained Claude
+    # transcripts, so the numerator has to span the same period. Dividing the
+    # repo's entire history by a few weeks of sessions mixes two windows and
+    # yields a number that looks like a pace but isn't one — it read 138 EP/day
+    # on a repo whose median tier was 8.8. `ep` (full history) stays as the
+    # informational "EP delivered" total.
+    if timestamps:
+        win_since, win_until = timestamps[0].isoformat(), timestamps[-1].isoformat()
+        ep_window = total_ep(commit_records(repo, since=win_since, until=win_until,
+                                           author=author),
+                             markdown_lines_added(repo, since=win_since, until=win_until,
+                                                  author=author),
+                             subagent_records(claude, since=timestamps[0],
+                                              until=timestamps[-1]))
+    else:
+        ep_window = total_ep([], 0, [])
+    ep_per_natural = ep_window["total"] / natural_days if natural_days else 0
+    ep_per_hour = ep_window["total"] / (dedication_sec / 3600) if dedication_sec else 0
 
     out = {
         "repo": str(repo),
@@ -524,7 +609,9 @@ def cmd_calibrate(args) -> None:
         "natural_days": natural_days,
         "session_count": len(sessions),
         "ep": ep,
+        # Ratios span first_event..last_event, not the repo's whole history.
         "pace_observed": {
+            "ep_in_window": ep_window["total"],
             "ep_per_natural_day": round(ep_per_natural, 2),
             "ep_per_dedication_hour": round(ep_per_hour, 2),
         },
@@ -540,6 +627,9 @@ def cmd_calibrate(args) -> None:
     print(f"Natural days:       {natural_days}")
     print(f"EP delivered:       {ep['total']:.1f}  (commits {ep['commits_ep']}, "
           f"docs {ep['doc_ep']}, sub-agents {ep['subagents_ep']})")
+    if timestamps:
+        print(f"EP in session window: {ep_window['total']:.1f}  "
+              f"({timestamps[0].astimezone():%Y-%m-%d} → {timestamps[-1].astimezone():%Y-%m-%d})")
     print(f"  raw: {ep['raw']['commits']} commits / "
           f"{ep['raw']['doc_lines']} md lines / "
           f"{ep['raw']['subagent_runs']} sub-agent runs")
@@ -655,11 +745,20 @@ def cmd_status(args) -> None:
     dedication_sec = sum(s[2] for s in window_sessions)
     natural_days = len({s[0].astimezone().strftime("%Y-%m-%d") for s in window_sessions})
 
-    since_str = started.strftime("%Y-%m-%d %H:%M")
+    # isoformat() keeps the offset. A naive "%Y-%m-%d %H:%M" is read by git as
+    # local time while `started` is UTC, shifting the window earlier by the UTC
+    # offset and sweeping in commits made before the unit was even locked.
+    since_str = started.isoformat()
+    # Author filtering was applied to calibrate but not here, so the tiers were
+    # personal while a unit's progress still counted the whole team.
+    author = unit.get("author") or git_default_author(repo) or None
+    _warn_unresolvable_branch(repo, unit.get("branch"))
     commits = commit_records(repo, since=since_str,
                              pattern=unit.get("commit_filter"),
-                             branch=unit.get("branch"))
-    md_total = markdown_lines_added(repo, since=since_str)
+                             branch=unit.get("branch"), author=author)
+    md_total = markdown_lines_added(repo, since=since_str, author=author,
+                                    pattern=unit.get("commit_filter"),
+                                    branch=unit.get("branch"))
     subs = subagent_records(claude, since=started, until=now)
     ep = total_ep(commits, md_total, subs)
 
@@ -780,19 +879,30 @@ def cmd_complete(args) -> None:
     now = dt.datetime.now(dt.timezone.utc)
 
     claude = claude_project_dir(repo)
-    since_str = started.strftime("%Y-%m-%d %H:%M")
+    since_str = started.isoformat()  # see cmd_status: naive strings shift the window
+    author = unit.get("author") or git_default_author(repo) or None
+    _warn_unresolvable_branch(repo, unit.get("branch"))
     commits = commit_records(repo, since=since_str,
                              pattern=unit.get("commit_filter"),
-                             branch=unit.get("branch"))
-    md_total = markdown_lines_added(repo, since=since_str)
+                             branch=unit.get("branch"), author=author)
+    md_total = markdown_lines_added(repo, since=since_str, author=author,
+                                    pattern=unit.get("commit_filter"),
+                                    branch=unit.get("branch"))
     subs = subagent_records(claude, since=started, until=now)
     measured_ep = total_ep(commits, md_total, subs)["total"]
     ep_actual = args.ep_actual if args.ep_actual is not None else measured_ep
 
     timestamps = gather_timestamps(claude) if claude else []
     sessions = filter_sessions(compute_sessions(timestamps), since=started, until=now)
-    days_actual = len({s[0].astimezone().strftime("%Y-%m-%d") for s in sessions}) \
-                  or max(1, int((now - started).total_seconds() / 86400))
+    session_days = len({s[0].astimezone().strftime("%Y-%m-%d") for s in sessions})
+    # Falling back to calendar days keeps the field populated, but calendar days
+    # and active days are different units — `days_source` records which one this
+    # is so the days-bias never divides one by the other (see rebuild_profile).
+    if session_days:
+        days_actual, days_source = session_days, "sessions"
+    else:
+        days_actual = max(1, int((now - started).total_seconds() / 86400))
+        days_source = "calendar_fallback"
 
     record = {
         "repo": str(repo),
@@ -806,6 +916,7 @@ def cmd_complete(args) -> None:
         "ep_measured": round(measured_ep, 2),
         "days_central": unit.get("natural_days_central"),
         "days_actual": days_actual,
+        "days_source": days_source,
         "anchor_used": unit.get("anchor_used"),
         "pace_value": unit.get("pace_value"),
         "commits": len(commits),
