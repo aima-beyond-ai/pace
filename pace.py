@@ -208,23 +208,72 @@ def _warn_unresolvable_base(repo: Path, base_commit: str | None) -> None:
           file=sys.stderr)
 
 
+def _usable_branch(branch: str | None, repo: Path | None) -> bool:
+    """True if `branch` can scope a revision walk.
+
+    `HEAD` is rejected on purpose: `pace start` records
+    `rev-parse --abbrev-ref HEAD`, which yields the literal string "HEAD" in a
+    detached checkout. That string resolves later too, but to wherever HEAD has
+    moved since — a moving target, not the unit's lineage.
+    """
+    if not branch or branch == "HEAD":
+        return False
+    return repo is None or _rev_resolves(repo, branch)
+
+
 def _rev_args(base_commit: str | None, branch: str | None,
               repo: Path | None = None) -> list[str]:
     """Revision selection for a unit's measurement window.
 
-    Anchoring on the commit HEAD pointed at when the unit was locked and then
-    searching every ref (`--all --not <base>`) survives what a branch name does
-    not: work on a feature branch that isn't merged yet, a branch deleted by
-    `--delete-branch` on merge, and renames. It also excludes commits made
-    *before* the lock, which a time window alone lets through at clock
-    resolution. `branch` remains the fallback for units locked before
-    base_commit existed, or whose base was rewritten away.
+    Anchoring on the commit HEAD pointed at when the unit was locked excludes
+    commits made *before* the lock, which a time window alone lets through at
+    clock resolution. The anchor says *when*; the branch says *where*, and both
+    are needed.
+
+    🛑 **`--all --not <base>` alone counts sibling branches, and that was a real
+    bug.** Every ref that descends from the anchor comes back, so post-start
+    commits the same author made on ANOTHER branch were credited to the active
+    unit. Measured on git 2.43: two branches off one base, `--all --not <base>`
+    returns both commits. The damage is not cosmetic — it inflates a unit toward
+    a false COMPLETE and writes that distortion into the bias history, which
+    later forecasts read back. Working in several branches at once is the normal
+    case here, not a corner one.
+
+    So the branch scopes the walk whenever it still resolves. `--all` survives
+    only as the degraded fallback for the cases it was introduced for — a branch
+    deleted by `--delete-branch` on merge, or renamed — where over-counting beats
+    measuring nothing. `_warn_widened_scope` says so out loud when it happens,
+    because a silent widening is exactly how the original bug stayed invisible.
     """
-    if base_commit and (repo is None or _rev_resolves(repo, base_commit)):
+    base_ok = bool(base_commit) and (repo is None or _rev_resolves(repo, base_commit))
+    branch_ok = _usable_branch(branch, repo)
+
+    if base_ok and branch_ok:
+        return [branch, "--not", base_commit]
+    if base_ok:
         return ["--all", "--not", base_commit]
-    if branch:
+    if branch_ok:
         return [branch]
     return []
+
+
+def _warn_widened_scope(repo: Path, base_commit: str | None,
+                        branch: str | None) -> None:
+    """Warn when the walk falls back to every ref because the branch is gone.
+
+    Only fires in the degraded case: the anchor resolves but the recorded branch
+    does not, so `_rev_args` widens to `--all`. In that state the count may
+    include work the same author did on other branches — see `_rev_args`.
+    """
+    if not base_commit or not _rev_resolves(repo, base_commit):
+        return
+    if _usable_branch(branch, repo):
+        return
+    where = f"branch {branch!r}" if branch else "no branch recorded"
+    print(f"WARNING: {where} for this unit does not resolve — measuring across "
+          f"ALL refs since {base_commit[:12]}. Commits you made on other "
+          f"branches since then WILL be counted. Treat the numbers as an upper "
+          f"bound.", file=sys.stderr)
 
 
 def git_default_author(repo: Path | None = None) -> str:
@@ -795,6 +844,7 @@ def cmd_status(args) -> None:
     _warn_unresolvable_base(repo, base_commit)
     if not base_commit or not _rev_resolves(repo, base_commit):
         _warn_unresolvable_branch(repo, unit.get("branch"))
+    _warn_widened_scope(repo, base_commit, unit.get("branch"))
     commits = commit_records(repo, since=since_str,
                              pattern=unit.get("commit_filter"),
                              branch=unit.get("branch"), author=author,
@@ -934,6 +984,7 @@ def cmd_complete(args) -> None:
     _warn_unresolvable_base(repo, base_commit)
     if not base_commit or not _rev_resolves(repo, base_commit):
         _warn_unresolvable_branch(repo, unit.get("branch"))
+    _warn_widened_scope(repo, base_commit, unit.get("branch"))
     commits = commit_records(repo, since=since_str,
                              pattern=unit.get("commit_filter"),
                              branch=unit.get("branch"), author=author,
